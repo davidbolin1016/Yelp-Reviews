@@ -1,0 +1,214 @@
+---
+title: "Predicting the Usefulness of Yelp Reviews"
+author: "David Bolin"
+date: "March 25, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, hide = TRUE)
+```
+
+```{r init}
+library(dplyr)
+library(stringr)
+library(tm)
+library(quanteda)
+library(ggplot2)
+library(caret)
+library(glmnet)
+library(dummies)
+library(randomForest)
+
+set.seed(0) # Ensure that my results can be reproduced
+```
+
+In this project I take the Yelp dataset from <https://www.yelp.com/dataset_challenge> and attempt to predict the usefulness of the reviews, as measured by user votes, from other features of the reviews. It turns out that most of the potential predictive power can be achieved by a simple linear model based on the length of the review, or on the length of the review together with the number of stars given. It is possible, however, to produce an improved model by including features of the text of the review.
+
+I converted the dataset files to .csv using Paul Butler's Python code at <https://gist.github.com/paulgb/5265767>. Due to the memory limits of my PC, I took five percent (111,260 reviews) of the set of reviews as a training set, and another five percent as a test set.
+
+```{r prepare set}
+reviews_set1 <- read.csv("reviews01.csv")
+reviews_set2 <- read.csv("reviews02.csv")
+names(reviews_set2) <- names(reviews_set1)
+reviews_all <- rbind(reviews_set1, reviews_set2)
+
+# Useful columns: text of review, number of stars, number of votes that the review was useful
+reviews_newdf <- select(reviews_all, stars, votes_useful, text)
+
+# Take the number of stars as a factor
+stars_df <- as.data.frame(dummy(reviews_newdf$stars))
+colnames(stars_df) <- c("stars1", "stars2", "stars3", "stars4", "stars5")
+
+# Function to clean a list of reviews
+clean_text <- function(rev_list) {
+  clntxt <- lapply(rev_list, as.character)
+  clntxt <- tolower(clntxt)
+  clntxt <- removeWords(clntxt, stopwords("SMART"))
+  clntxt <- lapply(clntxt, str_replace_all, pattern = "[[:punct:]]", replacement = "")
+  clntxt <- as.character(clntxt)
+  return(clntxt)
+}
+
+# Clean the reviews and add the number of words for each review
+reviews_newdf$text <- clean_text(reviews_newdf$text)
+reviews_newdf$n_words <- sapply(reviews_newdf$text, str_count, pattern = " ") + 1
+reviews_text <- reviews_newdf$text
+```
+
+The distributions of the votes and of the number of words in a review are skewed, and after considering various possibilities, I decided to use a log transformation on both. The log transform of the length was then scaled to have a mean of 0 and a standard deviation of 1. 
+
+```{r transform}
+reviews_length <- cbind(select(reviews_newdf, votes_useful, n_words)
+                  , stars_df[,c(1, 2, 4, 5)]) # leaves out "3 stars" column to avoid collinearity
+reviews_length$votes_useful <- log(reviews_length$votes_useful + 1)
+reviews_length$n_words <- scale(log(reviews_length$n_words))
+scaled_center <- attributes(reviews_length$n_words)$"scaled:center"
+scaled_scale <- attributes(reviews_length$n_words)$"scaled:scale"
+```
+
+If we plot the number of words in a review against usefulness, we can see that generally a greater number of words predicts greater utility, but there seems to be some non-linearity at the end of the scale: if the review is too long, perhaps people don't bother to read it, or in any case the marginal benefit of the length diminishes.
+
+```{r length and usefulness, hide = FALSE}
+ggplot(reviews_length, aes(n_words, votes_useful)) + 
+  geom_jitter(alpha = 0.02, width = 0, height = .9) + geom_smooth() +
+  labs(title = "Length vs Usefulness", x = "Number of Words (transformed log scale)", y = "Number of Votes (log scale)")
+```
+
+While the code is not included here, I attempted to predict the usefulness of the review from length, using a random forest to account for the non-linearity. This was able to explain about 11% of the variance in the number of useful votes. However, a simpler method is to try to predict the usefulness with a linear model, but with dummy variables for very short or very long reviews.
+
+```{r linear model, hide = FALSE}
+# Create dummy variables for under 20 words and over 700 words
+reviews_length$under20 <- as.numeric(reviews_newdf$n_words < 20)
+reviews_length$over700 <- as.numeric(reviews_newdf$n_words > 700)
+l_model <- lm(votes_useful ~ ., data = reviews_length)
+summary(l_model)
+```
+
+The linear model using such dummy variables works about as well as the random forest, with an adjusted R-squared of 0.118, so I based my model on this for the sake of simplicity. The question is whether it is possible to improve on this linear model. Attempting such an improvement, I constructed a text feature matrix using the quanteda R package, and then tried predicting the quality of the review from text features, together with the number of stars and the length of the review, using regularized linear regression. Since there are over 100,000 reviews in the training set, I only consider words that occurr in the reviews fairly often, choosing only those which have more than 800 occurrences in the training and test sets taken together.
+
+```{r text features}
+f_matrix <- dfm(reviews_text, ngrams = 1)
+f_matrix_trimmed <- f_matrix[, colSums(f_matrix) > 800]
+f_matrix_trimmed <- cbind(f_matrix_trimmed, as.matrix(reviews_length[c("n_words", "stars1",
+                    "stars2", "stars4", "stars5", "under20", "over700")]))
+
+ntest <- 111260 # takes the first set of reviews as the training set
+target <- reviews_length$votes_useful
+model <- cv.glmnet(f_matrix_trimmed[1:ntest,], target[1:ntest])
+coefs <- coef(model, model$lambda.min)
+coefs <- as.data.frame(as.matrix(coefs))
+coefs <- cbind(rownames(coefs), coefs)
+coefs <- coefs[coefs$"1" != 0 ,]
+```
+
+The new model continues to assign a large amount of weight to the number of words, with a generally positive association between length and usefulness, but with a negative coefficient to the property of having more than 700 words, as we suspected from the plot of the length vs usefulness. This does not necessarily signify that long reviews are not useful, but merely that a correction is necessary in order to avoid putting too much weight on the length. We can look at the words most predictive of usefulness according to the model:    
+
+limo, ya, ass, yelpers, shit, won, dude...    
+
+Interestingly, some of the words which are most predictive of usefulness are quite negative in tone. This might be related to the fact that extremely negative reviews are rare, and consequently seem more informative. This is supported by the relatively high coefficient given to having only one star.
+
+The correlation between the number of votes predicted by this model for the test set and the actual number of votes is .369, which implies that our model can explain 13.6% of the variance in the number of votes. This is only a modest improvement over the linear mode, but it is an actual improvement, not merely an apparent one, since we are getting this improvement while testing the model against new data.
+
+```{r correlation}
+test_correlation <- cor(target[(ntest+1):length(target)], 
+                        predict(model, f_matrix_trimmed[(ntest+1):length(target)], s = model$lambda.min)) 
+```
+
+Since the text feature matrix was created using the vocabulary from the entire set of reviews, I needed to do a bit more work in order to produce a method of creating predictions for entirely new reviews, outside the training and test sets. In essence it was necessary to count the number of times each feature occurs in the new text and then to apply the coefficients of the model to the results in order to produce the new predictions.
+
+```{r new reviews}
+# Select reviews for a particular business
+sel_business <- function(df, businessid) {
+  filter(df, business_id == businessid)
+}
+
+# Calculate predictions for a particular business 
+new_predict <- function(business_df) {
+  names(business_df) <- names(reviews_set1)
+  business_df$text <- clean_text(business_df$text)
+  new_matrix <- dfm(business_df$text, verbose = FALSE)
+  new_matrix_names <- colnames(new_matrix)
+  additional_names <- setdiff(rownames(coefs), new_matrix_names)
+  additional_matrix <- Matrix(0, nrow = nrow(new_matrix), ncol = length(additional_names), sparse = TRUE)
+  colnames(additional_matrix) <- additional_names
+  new_matrix <- cbind(new_matrix, additional_matrix)
+  new_matrix <- new_matrix[,rownames(coefs)]
+  new_matrix <- as.data.frame(new_matrix)
+  new_matrix$n_words <- sapply(business_df$text, str_count, pattern = " ")
+  business_df$n_words <- new_matrix$n_words
+  new_matrix$n_words <- scale(log(new_matrix$n_words + 1), center = scaled_center, scale = scaled_scale)
+  new_matrix$stars1 <- as.numeric(business_df$stars == 1)
+  new_matrix$stars2 <- as.numeric(business_df$stars == 2)
+  new_matrix$stars4 <- as.numeric(business_df$stars == 4)
+  new_matrix$stars5 <- as.numeric(business_df$stars == 5)
+  new_matrix$under20 <- as.numeric(business_df$n_words < 20)
+  new_matrix$over700 <- as.numeric(business_df$n_words > 700)
+ 
+  # Multiply out the coefficients to calculate new predictions
+  new_predictions <- rep(coefs$"1"[1], nrow(new_matrix))
+  multiplied_coef <- as.matrix(new_matrix) %*% coefs[[2]]
+  new_predictions <- new_predictions + rowSums(multiplied_coef)
+  new_predictions <- exp(new_predictions) - 1
+  new_predictions[new_predictions < 0] <- 0
+  return(new_predictions)
+}
+```
+
+Applying this method to a new business from a third set of reviews (another five percent of Yelp's dataset), visual inspection of the results in RStudio verifies that the model does a good of distinguishing somewhat useful reviews from useless reviews. However, it also indicates (as noted above) that this results largely from the length of the review.
+
+```{r particular example}
+# Particular example from new set of reviews
+new_reviews_df <- read.csv("reviews03.csv") # A third set of reviews, outside the training and test sets
+names(new_reviews_df) <- names(reviews_set1)
+new_reviews <- sel_business(new_reviews_df, "lAher1puKzN9r3LALx-JqQ") # Example business
+new_reviews$predictions <- new_predict(new_reviews)
+```
+
+In the example in question, we can look at the review that the model views as the most useful:
+
+```{r most useful, hide = FALSE}
+# Create data frame ordered according to predicted usefulness
+new_reviews_sorted <- new_reviews[order(new_reviews$predictions, decreasing = TRUE),]
+new_reviews_sorted$text <- as.character(new_reviews_sorted$text)
+cat(str_wrap(c("1.", new_reviews_sorted$text[1])))
+```
+
+And the two least useful:
+
+```{r least useful, hide = FALSE}
+new_reviews_sorted <- new_reviews[order(new_reviews$predictions),]
+new_reviews_sorted$text <- as.character(new_reviews_sorted$text)
+cat("1.", new_reviews_sorted$text[1])
+cat("2.", new_reviews_sorted$text[2])
+```
+
+The difference is evident. Using Spearman's rank-order correlation, I calculated a correlation of .41 between the ranking produced by the model and the actual votes.
+
+```{r rank order accuracy example}
+suppressWarnings(cor.test(new_reviews$votes_useful, new_reviews$predictions, 
+                          method = "spearman", alternative = "greater"))
+```
+
+This is somewhat higher than the average Spearman rank-order correlation over all businesses in the third set of reviews, which came to about .34. 
+
+```{r average accuracy of rank order}
+new_reviews_df$business_id <- as.character(new_reviews_df$business_id)
+ids <- filter(new_reviews_df %>% group_by(business_id) %>% summarise(number = n()), number > 20)
+cor_values <- rep(0, length(ids))
+count <- 0
+
+for (i in ids$business_id) {
+  business_df <- sel_business(new_reviews_df, i)
+  predictions <- new_predict(business_df)
+  c = suppressWarnings(cor.test(business_df$votes_useful, predictions, 
+                       method = "spearman", alternative = "greater"))
+  count <- count + 1
+  cor_values[count] <- c$estimate
+}
+cat("Average accuracy in rank ordering: ", mean(cor_values, na.rm = TRUE))
+```
+
+Overall, the model does improve on the simple linear model based on length, but not by much. However, there are suggestions in our results that yet more improvement is possible. For example, the model tends to put a high weight on words with a negative tone. This suggests that it might be possible to obtain better results by applying more sophisticated NLP methods, such as sentiment analysis.
+
+This is a fairly common situation: most of the potential predictive power can be obtained fairly easily. Improvement is possible, but rapidly diminishing improvements require the application of rapidly increasing resources in terms of computing power, algorithmic complexity, and technical skill. In any particular case, one must determine to what degree it is worthwhile to apply these resources for the sake of the goal in question.
